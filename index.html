@@ -150,6 +150,16 @@ details.setup code{background:var(--code-bg);padding:1px 5px;border-radius:4px;f
   color:var(--bg);padding:9px 18px;border-radius:20px;font-size:13px;opacity:0;transition:.25s;z-index:99;pointer-events:none}
 #toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
 
+/* ---------- 编辑器 ---------- */
+#editorMask{position:fixed;inset:0;background:var(--bg);z-index:60;display:none;flex-direction:column}
+#editorMask.show{display:flex}
+#editorBar{display:flex;align-items:center;gap:8px;padding:10px 14px;border-bottom:1px solid var(--border);background:var(--panel);flex-shrink:0}
+#editorBar .path{font-size:12px;color:var(--muted);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
+#editorArea{flex:1;width:100%;padding:16px 18px;border:none;background:var(--bg);color:var(--text);
+  font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:14px;line-height:1.65;resize:none;outline:none}
+#editorStatus{padding:7px 14px;font-size:12px;color:var(--muted);border-top:1px solid var(--border);background:var(--panel);flex-shrink:0;min-height:30px}
+.btn.small{flex:none;padding:7px 14px;font-size:13px}
+
 /* ---------- 移动端（iPhone / iPad 竖屏） ---------- */
 @media (max-width:760px){
   header h1{display:none}
@@ -171,8 +181,10 @@ details.setup code{background:var(--code-bg);padding:1px 5px;border-radius:4px;f
 
 <header>
   <button class="iconbtn" id="menuBtn" title="目录">☰</button>
-  <h1>🖋 Stroke<span>Sync</span> <sup style="font-size:10px;color:var(--muted)">v7</sup></h1>
+  <h1>🖋 Stroke<span>Sync</span> <sup style="font-size:10px;color:var(--muted)">v8</sup></h1>
   <div id="searchBox"><input id="searchInput" type="search" placeholder="搜索笔记标题 / 全文…（≥2字）" autocomplete="off"></div>
+  <button class="iconbtn" id="newBtn" title="新建笔记">🆕</button>
+  <button class="iconbtn" id="editBtn" title="编辑当前笔记">✏️</button>
   <button class="iconbtn" id="foldAllBtn" title="全部折叠 / 全部展开">⊟</button>
   <button class="iconbtn" id="themeBtn" title="切换深浅色">🌙</button>
   <button class="iconbtn" id="settingsBtn" title="设置仓库">⚙️</button>
@@ -224,11 +236,23 @@ details.setup code{background:var(--code-bg);padding:1px 5px;border-radius:4px;f
         <li>把本页 <code>index.html</code> 放进公开仓库根目录 → Settings → Pages → <code>Deploy from a branch</code> → <code>main</code> / <code>/ (root)</code>。</li>
         <li>电脑 Obsidian 安装社区插件 <b>Obsidian Git</b>；把笔记仓库 clone 到任意文件夹，再用 Obsidian「打开文件夹为仓库」。</li>
         <li>插件设置里建议：Push 间隔 <code>5</code> 分钟，启动时自动 pull + push，关闭时自动 push。</li>
-        <li>iPad Safari 打开 Pages 网址 → 分享 → <b>添加到主屏幕</b>；⚙️ 里填<b>笔记仓库</b>的 用户名/仓库名，私有仓库再填一个只读 Token。</li>
+        <li>iPad Safari 打开 Pages 网址 → 分享 → <b>添加到主屏幕</b>；⚙️ 里填<b>笔记仓库</b>的 用户名/仓库名。Token 权限选 <b>Contents: Read and write</b>（只读只能看，想用 iPad 编辑保存必须给写权限）。</li>
         <li>以后：电脑上写完笔记，插件几分钟内自动 push → 刷新本页面即可看到最新版。</li>
       </ol>
     </details>
   </div>
+</div>
+
+<div id="editorMask">
+  <div id="editorBar">
+    <span class="path" id="editorPath"></span>
+    <button class="btn small" id="imgBtn">📷 插入图片</button>
+    <button class="btn small" id="editorCancel">取消</button>
+    <button class="btn small primary" id="editorSave">保存到 GitHub</button>
+    <input type="file" id="imgInput" accept="image/*" style="display:none">
+  </div>
+  <textarea id="editorArea" spellcheck="false" placeholder="Markdown 内容…"></textarea>
+  <div id="editorStatus"></div>
 </div>
 
 <div id="toast"></div>
@@ -362,6 +386,135 @@ function renderTree(){
     parent.appendChild(el);
   });
 }
+
+/* ================= 编辑 & 保存到 GitHub ================= */
+var editSha = null, editPath = null, editDirty = false;
+
+function b64ToUtf8(b64){
+  var bin = atob(b64.replace(/\s/g,""));
+  var bytes = new Uint8Array(bin.length);
+  for(var i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i);
+  return new TextDecoder().decode(bytes);
+}
+function utf8ToB64(str){
+  var bytes = new TextEncoder().encode(str);
+  var bin = "";
+  for(var i=0;i<bytes.length;i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
+}
+
+async function ghPut(path, bodyObj){
+  var opt = {method:"PUT", headers:{Accept:"application/vnd.github+json","Content-Type":"application/json"}};
+  if(cfg.token) opt.headers.Authorization = "Bearer "+cfg.token;
+  opt.body = JSON.stringify(bodyObj);
+  var r = await fetch(apiBase()+"/contents/"+encodePath(path), opt);
+  if(!r.ok){
+    var msg = "HTTP "+r.status;
+    if(r.status===401) msg += "（Token 无效）";
+    else if(r.status===403) msg += "（Token 权限不足：需要 Contents: Read and write）";
+    else if(r.status===409) msg += "（冲突：GitHub 上已被修改，请关闭编辑器重新打开再改）";
+    try{ var t = await r.json(); if(t && t.message) msg += " · " + t.message; }catch(e){}
+    throw new Error(msg);
+  }
+  return r.json();
+}
+
+async function openEditor(path, isNew){
+  if(!cfg.token){ toast("私有仓库编辑需要 Token"); }
+  editPath = path; editSha = null; editDirty = false;
+  $("editorPath").textContent = (isNew ? "🆕 新建：" : "") + path;
+  $("editorStatus").textContent = "";
+  $("editorMask").classList.add("show");
+  $("editorArea").value = "";
+  if(!isNew){
+    $("editorStatus").textContent = "读取原文件…";
+    try{
+      var r = await ghFetch(apiBase()+"/contents/"+encodePath(path)+"?ref="+encodeURIComponent(cfg.branch));
+      var d = await r.json();
+      editSha = d.sha;
+      $("editorArea").value = b64ToUtf8(d.content);
+      $("editorStatus").textContent = "";
+    }catch(e){
+      $("editorStatus").textContent = "读取失败：" + e.message;
+      toast("读取失败");
+    }
+  }
+  $("editorArea").focus();
+}
+
+async function saveEditor(){
+  if(editPath == null) return;
+  var content = $("editorArea").value;
+  $("editorStatus").textContent = "保存中…";
+  try{
+    var body = {message:"Update "+editPath+" (StrokeSync on iPad)", content:utf8ToB64(content), branch:cfg.branch};
+    if(editSha) body.sha = editSha;
+    var d = await ghPut(editPath, body);
+    editSha = d.content && d.content.sha;
+    contentsCache[editPath] = content;
+    if(!files.some(function(f){return f.path===editPath;})){
+      var i = editPath.lastIndexOf("/");
+      files.push({path:editPath, name:editPath.slice(i+1), dir:i>=0?editPath.slice(0,i):""});
+      files.sort(function(a,b){ return a.path<b.path?-1:1; });
+      renderTree();
+    }
+    $("editorStatus").textContent = "✓ 已保存为 GitHub commit · " + new Date().toLocaleTimeString() + "（电脑 Obsidian 稍后自动 pull）";
+    toast("✓ 已保存");
+    openNote(editPath);
+  }catch(e){
+    $("editorStatus").textContent = "保存失败：" + e.message;
+  }
+}
+
+function readAsDataURL(file){
+  return new Promise(function(res, rej){
+    var fr = new FileReader();
+    fr.onload = function(){ res(fr.result); };
+    fr.onerror = rej;
+    fr.readAsDataURL(file);
+  });
+}
+
+$("editBtn").onclick = function(){ if(currentPath) openEditor(currentPath, false); else toast("先打开一篇笔记"); };
+$("newBtn").onclick = function(){
+  if(!cfg.owner){ toast("先配置仓库"); return; }
+  var name = prompt("新笔记文件名（可含子文件夹，自动补 .md）:", "新笔记.md");
+  if(!name) return;
+  name = name.trim(); if(!/\.md$/i.test(name)) name += ".md";
+  var root = cfg.path ? cfg.path+"/" : "";
+  openEditor(root+name, true);
+};
+$("editorCancel").onclick = function(){
+  if(editDirty && !confirm("有未保存的修改，确定放弃？")) return;
+  $("editorMask").classList.remove("show");
+};
+$("editorSave").onclick = saveEditor;
+$("editorArea").addEventListener("input", function(){ editDirty = true; });
+$("imgBtn").onclick = function(){ $("imgInput").click(); };
+$("imgInput").onchange = async function(){
+  var f = this.files[0]; this.value = "";
+  if(!f || editPath == null) return;
+  if(!cfg.token){ toast("上传图片需要 Token"); return; }
+  var dir = cfg.path ? cfg.path+"/" : "";
+  var attachDir = dir + "附件/";
+  var stamp = Date.now().toString(36);
+  var name = f.name.replace(/[^\w.\-\u4e00-\u9fff]+/g,"_");
+  var dest = attachDir + name;
+  if(imgIndex.some(function(p){return p.toLowerCase()===dest.toLowerCase();})) dest = attachDir + stamp + "_" + name;
+  $("editorStatus").textContent = "上传图片中…（"+dest+"）";
+  try{
+    var dataUrl = await readAsDataURL(f);
+    var b64 = dataUrl.split(",")[1];
+    await ghPut(dest, {message:"Add image "+dest+" (StrokeSync)", content:b64, branch:cfg.branch});
+    imgIndex.push(dest);
+    var ta = $("editorArea");
+    ta.value += (ta.value.endsWith("\n")||ta.value==="" ? "" : "\n") + "\n![["+name+"]]\n";
+    editDirty = true;
+    $("editorStatus").textContent = "✓ 图片已上传并插入引用（记得点保存提交整篇笔记）";
+  }catch(e){
+    $("editorStatus").textContent = "图片上传失败：" + e.message;
+  }
+};
 
 /* ================= 标题折叠 ================= */
 function foldStoreKey(){ return "strokesync_fold_"+cfg.owner+"/"+cfg.repo+"#"+currentPath; }
